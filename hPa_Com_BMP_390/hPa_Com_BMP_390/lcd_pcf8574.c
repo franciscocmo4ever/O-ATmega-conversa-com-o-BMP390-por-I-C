@@ -13,6 +13,10 @@
 #include "lcd_pcf8574.h"
 #include "twi_hw.h"
 
+#include <stdarg.h>   // va_list, va_start, va_end
+#include <stdio.h>    // vsnprintf
+
+
 // ====== Ajuste aqui se teu backpack for diferente ======
 #define LCD_PCF_RS   (1<<0)
 #define LCD_PCF_RW   (1<<1)
@@ -106,4 +110,14 @@ void lcd_goto(lcd_t *lcd, uint8_t row, uint8_t col)
 void lcd_print(lcd_t *lcd, const char *s)
 {
 	while (*s) dat(lcd, (uint8_t)*s++);
+}
+
+void lcd_printf(lcd_t *lcd, const char *fmt, ...)
+{
+    char buf[21];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    lcd_print(lcd, buf);
 }

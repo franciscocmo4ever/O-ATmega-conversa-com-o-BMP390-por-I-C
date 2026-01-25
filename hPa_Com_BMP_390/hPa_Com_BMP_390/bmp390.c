@@ -1,171 +1,192 @@
 /*
- * bmp390.h
+ * bmp390.c
  *
- * Created: 11/01/2026 21:01:21
- *  Author: franc
- */ 
+ * Driver mÃ­nimo do BMP390 (I2C) para ATmega328P.
+ * - init: softreset, chip_id, lÃª calibraÃ§Ã£o, configura OSR + IIR, habilita sensores.
+ * - read: dispara forced measurement, espera DRDY, lÃª dados (burst), compensa.
+ *
+ * Datasheet: BST-BMP390-DS002 (Appendix: computation formulae reference implementation)
+ */
 
-
+#ifndef F_CPU
 #define F_CPU 1000000UL
-
+#endif
 
 #include <util/delay.h>
 #include "bmp390.h"
 #include "twi_hw.h"
 
-// Registradores principais
-#define BMP390_REG_CHIP_ID     0x00
-#define BMP390_CHIP_ID_VAL     0x60   //
+// ---------- registers ----------
+#define BMP390_REG_CHIP_ID      0x00
+#define BMP390_REG_ERR_REG      0x02
+#define BMP390_REG_STATUS       0x03
+#define BMP390_REG_DATA_0       0x04  // press xlsb
+#define BMP390_REG_DATA_3       0x07  // temp xlsb
+#define BMP390_REG_PWR_CTRL     0x1B
+#define BMP390_REG_OSR          0x1C
+#define BMP390_REG_ODR          0x1D
+#define BMP390_REG_CONFIG       0x1F
+#define BMP390_REG_CALIB_START  0x31
+#define BMP390_REG_CMD          0x7E
 
-#define BMP390_REG_STATUS      0x03   // drdy bits (press/temp) :contentReference[oaicite:12]{index=12}
-#define BMP390_REG_PRESS_XLSB  0x04   // 0x04..0x06 :contentReference[oaicite:13]{index=13}
-#define BMP390_REG_TEMP_XLSB   0x07   // 0x07..0x09 :contentReference[oaicite:14]{index=14}
+// ---------- commands ----------
+#define BMP390_CMD_SOFTRESET    0xB6
 
-#define BMP390_REG_PWR_CTRL    0x1B
-#define BMP390_REG_OSR         0x1C
+// ---------- status bits ----------
+#define BMP390_STATUS_CMD_RDY   (1u << 4)
+#define BMP390_STATUS_DRDY_P    (1u << 5)
+#define BMP390_STATUS_DRDY_T    (1u << 6)
 
-// Calib NVM: 0x31..0x45 :contentReference[oaicite:15]{index=15}
-#define BMP390_REG_CALIB_START 0x31
-#define BMP390_CALIB_LEN       (0x45 - 0x31 + 1)
+// ---------- helpers ----------
+static uint16_t u16_le(const uint8_t *b) { return (uint16_t)((uint16_t)b[1] << 8 | b[0]); }
+static int16_t  s16_le(const uint8_t *b) { return (int16_t)((int16_t)b[1] << 8 | b[0]); }
 
-static double t_lin = 0.0;
-
-// Datasheet Appendix (compensação) :contentReference[oaicite:16]{index=16}
-static double bmp390_compensate_temperature(uint32_t uncomp_temp, const bmp390_calib_t *c)
+// coef conversions (do datasheet)
+static void bmp390_parse_and_convert_calib(bmp390_calib_t *c, const uint8_t *d21)
 {
-	double partial_data1 = (double)uncomp_temp - c->par_t1;
-	double partial_data2 = partial_data1 * c->par_t2;
+    // Raw NVM values (Table 24)
+    uint16_t nvm_t1 = u16_le(&d21[0]);
+    uint16_t nvm_t2 = u16_le(&d21[2]);
+    int8_t   nvm_t3 = (int8_t)d21[4];
 
-	t_lin = partial_data2 + (partial_data1 * partial_data1) * c->par_t3;
-	return t_lin;
+    int16_t  nvm_p1 = s16_le(&d21[5]);
+    int16_t  nvm_p2 = s16_le(&d21[7]);
+    int8_t   nvm_p3 = (int8_t)d21[9];
+    int8_t   nvm_p4 = (int8_t)d21[10];
+    uint16_t nvm_p5 = u16_le(&d21[11]);
+    uint16_t nvm_p6 = u16_le(&d21[13]);
+    int8_t   nvm_p7 = (int8_t)d21[15];
+    int8_t   nvm_p8 = (int8_t)d21[16];
+    int16_t  nvm_p9 = s16_le(&d21[17]);
+    int8_t   nvm_p10= (int8_t)d21[19];
+    int8_t   nvm_p11= (int8_t)d21[20];
+
+    // Conversions (Appendix 8.4)
+    c->par_t1  = (double)nvm_t1 * 256.0;                 // /2^-8
+    c->par_t2  = (double)nvm_t2 / 1073741824.0;          // /2^30
+    c->par_t3  = (double)nvm_t3 / 281474976710656.0;     // /2^48
+
+    c->par_p1  = ((double)nvm_p1 - 16384.0) / 1048576.0; // (nvm-2^14)/2^20
+    c->par_p2  = ((double)nvm_p2 - 16384.0) / 536870912.0;// (nvm-2^14)/2^29
+    c->par_p3  = (double)nvm_p3 / 4294967296.0;          // /2^32
+    c->par_p4  = (double)nvm_p4 / 137438953472.0;        // /2^37
+    c->par_p5  = (double)nvm_p5 * 8.0;                   // /2^-3
+    c->par_p6  = (double)nvm_p6 / 64.0;                  // /2^6
+    c->par_p7  = (double)nvm_p7 / 256.0;                 // /2^8
+    c->par_p8  = (double)nvm_p8 / 32768.0;               // /2^15
+    c->par_p9  = (double)nvm_p9 / 281474976710656.0;     // /2^48
+    c->par_p10 = (double)nvm_p10 / 281474976710656.0;    // /2^48
+    c->par_p11 = (double)nvm_p11 / 36893488147419103232.0;// /2^65
+
+    c->t_lin = 0.0;
 }
 
-static double bmp390_compensate_pressure(uint32_t uncomp_press, const bmp390_calib_t *c)
+// Datasheet Appendix 8.5 (retorna t_lin; temperatura em Â°C = t_lin)
+static double bmp390_comp_temp(uint32_t uncomp_temp, bmp390_calib_t *c)
 {
-	double partial_data1 = c->par_p6 * t_lin;
-	double partial_data2 = c->par_p7 * t_lin * t_lin;
-	double partial_data3 = c->par_p8 * t_lin * t_lin * t_lin;
-	double partial_out1  = c->par_p5 + partial_data1 + partial_data2 + partial_data3;
+    double partial_data1 = (double)uncomp_temp - c->par_t1;
+    double partial_data2 = partial_data1 * c->par_t2;
 
-	partial_data1 = c->par_p2 * t_lin;
-	partial_data2 = c->par_p3 * t_lin * t_lin;
-	partial_data3 = c->par_p4 * t_lin * t_lin * t_lin;
-	double partial_out2 = (double)uncomp_press * (c->par_p1 + partial_data1 + partial_data2 + partial_data3);
-
-	partial_data1 = (double)uncomp_press * (double)uncomp_press;
-	partial_data2 = c->par_p9 + (c->par_p10 * t_lin);
-	partial_data3 = partial_data1 * partial_data2;
-	double partial_data4 = partial_data3 + ((double)uncomp_press * partial_data1) * c->par_p11;
-
-	return partial_out1 + partial_out2 + partial_data4;
+    c->t_lin = partial_data2 + (partial_data1 * partial_data1) * c->par_t3;
+    return c->t_lin;
 }
 
-static void parse_calib(bmp390_calib_t *c, const uint8_t *b)
+// Datasheet Appendix 8.6 (retorna pressÃ£o em Pa)
+static double bmp390_comp_press(uint32_t uncomp_press, bmp390_calib_t *c)
 {
-	// Montagem little-endian (LSB no endereço menor) :contentReference[oaicite:17]{index=17}
-	uint16_t nvm_t1 = (uint16_t)b[0]  | ((uint16_t)b[1]  << 8); // 0x31..0x32
-	uint16_t nvm_t2 = (uint16_t)b[2]  | ((uint16_t)b[3]  << 8); // 0x33..0x34
-	int8_t   nvm_t3 = (int8_t)b[4];                             // 0x35
+    double t = c->t_lin;
 
-	int16_t  nvm_p1 = (int16_t)((uint16_t)b[5]  | ((uint16_t)b[6]  << 8)); // 0x36..0x37
-	int16_t  nvm_p2 = (int16_t)((uint16_t)b[7]  | ((uint16_t)b[8]  << 8)); // 0x38..0x39
-	int8_t   nvm_p3 = (int8_t)b[9];                                        // 0x3A
-	int8_t   nvm_p4 = (int8_t)b[10];                                       // 0x3B
-	uint16_t nvm_p5 = (uint16_t)b[11] | ((uint16_t)b[12] << 8);            // 0x3C..0x3D (unsigned)
-	uint16_t nvm_p6 = (uint16_t)b[13] | ((uint16_t)b[14] << 8);            // 0x3E..0x3F (unsigned)
-	int8_t   nvm_p7 = (int8_t)b[15];                                       // 0x40
-	int8_t   nvm_p8 = (int8_t)b[16];                                       // 0x41
-	int16_t  nvm_p9 = (int16_t)((uint16_t)b[17] | ((uint16_t)b[18] << 8)); // 0x42..0x43
-	int8_t   nvm_p10= (int8_t)b[19];                                       // 0x44
-	int8_t   nvm_p11= (int8_t)b[20];                                       // 0x45
+    double partial_data1 = c->par_p6 * t;
+    double partial_data2 = c->par_p7 * (t * t);
+    double partial_data3 = c->par_p8 * (t * t * t);
+    double partial_out1  = c->par_p5 + partial_data1 + partial_data2 + partial_data3;
 
-	// Conversões do datasheet (sec. 8.4) :contentReference[oaicite:18]{index=18}
-	// Observação: o datasheet escreve divisões por 2^(expoente), incluindo expoentes negativos.
-	c->par_t1 = (double)nvm_t1 * 256.0;                          // / 2^-8  = *2^8
-	c->par_t2 = (double)nvm_t2 / 1073741824.0;                   // / 2^30
-	c->par_t3 = (double)nvm_t3 / 281474976710656.0;              // / 2^48
+    partial_data1 = c->par_p2 * t;
+    partial_data2 = c->par_p3 * (t * t);
+    partial_data3 = c->par_p4 * (t * t * t);
+    double partial_out2 = (double)uncomp_press * (c->par_p1 + partial_data1 + partial_data2 + partial_data3);
 
-	c->par_p1 = (double)((int32_t)nvm_p1 - 16384) / 1048576.0;   // (p1-2^14)/2^20
-	c->par_p2 = (double)((int32_t)nvm_p2 - 16384) / 536870912.0; // (p2-2^14)/2^29
-	c->par_p3 = (double)nvm_p3 / 4294967296.0;                   // /2^32
-	c->par_p4 = (double)nvm_p4 / 137438953472.0;                 // /2^37
-	c->par_p5 = (double)nvm_p5 * 8.0;                            // /2^-3 = *8
-	c->par_p6 = (double)nvm_p6 / 64.0;                           // /2^6
-	c->par_p7 = (double)nvm_p7 / 256.0;                          // /2^8
-	c->par_p8 = (double)nvm_p8 / 32768.0;                        // /2^15
-	c->par_p9 = (double)nvm_p9 / 281474976710656.0;              // /2^48
-	c->par_p10= (double)nvm_p10/ 281474976710656.0;              // /2^48
-	c->par_p11= (double)nvm_p11/ 36893488147419103232.0;         // /2^65
+    partial_data1 = (double)uncomp_press * (double)uncomp_press;
+    partial_data2 = c->par_p9 + c->par_p10 * t;
+    partial_data3 = partial_data1 * partial_data2;
+
+    double partial_data4 = partial_data3 + ((double)uncomp_press * (double)uncomp_press * (double)uncomp_press) * c->par_p11;
+
+    return partial_out1 + partial_out2 + partial_data4;
 }
 
-static uint8_t bmp390_read_chip_id(uint8_t addr, uint8_t *id)
+uint8_t bmp390_init(bmp390_t *dev, uint8_t addr7)
 {
-	return i2c_read_regs(addr, BMP390_REG_CHIP_ID, id, 1);
-}
+    if (!dev) return 100;
 
-uint8_t bmp390_init(bmp390_t *dev, uint8_t addr)
-{
-	dev->addr = addr;
+    dev->addr = addr7;
 
-	uint8_t id = 0;
-	if (bmp390_read_chip_id(addr, &id)) return 1;
-	if (id != BMP390_CHIP_ID_VAL) return 2;
+    // soft reset
+    if (i2c_write_reg(dev->addr, BMP390_REG_CMD, BMP390_CMD_SOFTRESET)) return 1;
+    _delay_ms(5);
 
-	// Lê calib 0x31..0x45 :contentReference[oaicite:19]{index=19}
-	uint8_t buf[BMP390_CALIB_LEN];
-	if (i2c_read_regs(addr, BMP390_REG_CALIB_START, buf, BMP390_CALIB_LEN)) return 3;
-	parse_calib(&dev->calib, buf);
+    // chip id
+    uint8_t id = 0;
+    if (i2c_read_reg(dev->addr, BMP390_REG_CHIP_ID, &id)) return 2;
 
-	// Oversampling:
-	// osr_p (bits 2..0), osr_t (bits 5..3)
-	// 0x00=x1, 0x01=x2, 0x02=x4, 0x03=x8...
-	const uint8_t osr_p = 0x02; // x4
-	const uint8_t osr_t = 0x01; // x2
-	uint8_t osr = (uint8_t)((osr_t << 3) | (osr_p));
-	if (i2c_write_reg(addr, BMP390_REG_OSR, osr)) return 4;
+    // Datasheet: chip_id novo (varia por revisÃ£o). Em muitos mÃ³dulos aparece 0x60.
+    if (id != 0x60 && id != 0x50) {
+        // ainda assim deixa seguir, mas avisa via erro = 3
+        return 3;
+    }
 
-	// PWR_CTRL:
-	// bit0 press_en, bit1 temp_en, mode[5:4] (00 sleep, 01 forced, 10 normal)
-	// Deixa em sleep por padrão; no loop a gente dispara forced.
-	uint8_t pwr_sleep = (1<<0) | (1<<1); // press/temp enable, mode=00
-	if (i2c_write_reg(addr, BMP390_REG_PWR_CTRL, pwr_sleep)) return 5;
+    // lÃª calibraÃ§Ã£o (0x31..0x45 => 21 bytes)
+    uint8_t calib[21];
+    if (i2c_read_regs(dev->addr, BMP390_REG_CALIB_START, calib, 21)) return 4;
+    bmp390_parse_and_convert_calib(&dev->calib, calib);
 
-	return 0;
-}
+    // Configura OSR (press x4, temp x2): osr_t em bits 5..3, osr_p em 2..0
+    // osr_p: 010=x4 ; osr_t: 001=x2  => 0b001_010 = 0x0A
+    if (i2c_write_reg(dev->addr, BMP390_REG_OSR, 0x0A)) return 5;
 
-static uint8_t bmp390_trigger_forced(uint8_t addr)
-{
-	// press_en=1, temp_en=1, mode=01 (forced)
-	uint8_t pwr_forced = (1<<0) | (1<<1) | (1<<4);
-	return i2c_write_reg(addr, BMP390_REG_PWR_CTRL, pwr_forced);
+    // IIR filter coef_3 (010 em bits 3..1) => 0x04
+    if (i2c_write_reg(dev->addr, BMP390_REG_CONFIG, 0x04)) return 6;
+
+    // ODR nÃ£o importa em forced, mas deixa default 0x00
+    (void)i2c_write_reg(dev->addr, BMP390_REG_ODR, 0x00);
+
+    // habilita sensores e deixa em sleep (mode=00)
+    // press_en=1 (bit0), temp_en=1 (bit1), mode=00 (bits 5..4)
+    if (i2c_write_reg(dev->addr, BMP390_REG_PWR_CTRL, 0x03)) return 7;
+
+    return 0;
 }
 
 uint8_t bmp390_read(bmp390_t *dev, double *temp_c, double *press_pa)
 {
-	if (bmp390_trigger_forced(dev->addr)) return 1;
+    if (!dev || !temp_c || !press_pa) return 100;
 
-	// Espera data ready (STATUS 0x03: drdy_press e drdy_temp) :contentReference[oaicite:23]{index=23}
-	for (uint16_t t = 0; t < 600; t++)
-	{
-		uint8_t st = 0;
-		if (i2c_read_regs(dev->addr, BMP390_REG_STATUS, &st, 1)) return 2;
+    // Dispara forced measurement: mode=01 em bits 5..4 => 0x10; + press_en/temp_en => 0x03
+    if (i2c_write_reg(dev->addr, BMP390_REG_PWR_CTRL, 0x13)) return 1;
 
-		uint8_t drdy_press = (st & (1<<5)) != 0;
-		uint8_t drdy_temp  = (st & (1<<6)) != 0;
-		if (drdy_press && drdy_temp) break;
+    // espera DRDY (temp e press)
+    for (uint16_t t = 0; t < 800; t++) {
+        uint8_t st = 0;
+        if (i2c_read_reg(dev->addr, BMP390_REG_STATUS, &st)) return 2;
 
-		_delay_ms(1);
-		if (t == 599) return 3;
-	}
+        if ((st & BMP390_STATUS_DRDY_P) && (st & BMP390_STATUS_DRDY_T)) break;
 
-	// Lê 6 bytes: press(3) + temp(3) :contentReference[oaicite:24]{index=24}
-	uint8_t b[6];
-	if (i2c_read_regs(dev->addr, BMP390_REG_PRESS_XLSB, b, 6)) return 4;
+        _delay_ms(1);
+        if (t == 799) return 3;
+    }
 
-	uint32_t up = ((uint32_t)b[2] << 16) | ((uint32_t)b[1] << 8) | (uint32_t)b[0];
-	uint32_t ut = ((uint32_t)b[5] << 16) | ((uint32_t)b[4] << 8) | (uint32_t)b[3];
+    // burst read: press(3) + temp(3), little-endian (xlsb,lsb,msb)
+    uint8_t b[6];
+    if (i2c_read_regs(dev->addr, BMP390_REG_DATA_0, b, 6)) return 4;
 
-	*temp_c  = bmp390_compensate_temperature(ut, &dev->calib);
-	*press_pa= bmp390_compensate_pressure(up, &dev->calib);
-	return 0;
+    uint32_t up = ((uint32_t)b[2] << 16) | ((uint32_t)b[1] << 8) | (uint32_t)b[0];
+    uint32_t ut = ((uint32_t)b[5] << 16) | ((uint32_t)b[4] << 8) | (uint32_t)b[3];
+
+    double tlin = bmp390_comp_temp(ut, &dev->calib);
+    double pa   = bmp390_comp_press(up, &dev->calib);
+
+    *temp_c  = tlin;  // datasheet: t_lin jÃ¡ Ã© temperatura compensada (Â°C)
+    *press_pa= pa;
+
+    return 0;
 }
